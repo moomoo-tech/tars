@@ -272,6 +272,10 @@ tars events list --since 1d --tag dogfood
 tars events show <event_id> --with-bodies
 ```
 
+For trajectory inspection, live stderr streaming, JSON-mode logging,
+and the layered "I want to debug X → look at Y" mapping, see
+[`observability.md`](./observability.md).
+
 ## When NOT to use tars
 
 - **You only call one provider, one model, one prompt shape.** A

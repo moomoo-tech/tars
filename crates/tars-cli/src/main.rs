@@ -13,8 +13,8 @@
 use std::process::ExitCode;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
-use tars_melt::TelemetryConfig;
+use clap::{Parser, Subcommand, ValueEnum};
+use tars_melt::{TelemetryConfig, TelemetryFormat};
 
 mod bench;
 mod config_loader;
@@ -46,8 +46,33 @@ struct Cli {
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     verbose: u8,
 
+    /// Stderr log format. `pretty` is human-readable (default); `json`
+    /// emits one JSON record per event, suitable for piping into a log
+    /// aggregator (Datadog / Loki / ELK). Overrides `TARS_LOG_FORMAT`
+    /// if both are set.
+    #[arg(long, global = true, value_enum, env = "TARS_LOG_FORMAT_FLAG")]
+    log_format: Option<LogFormat>,
+
     #[command(subcommand)]
     command: Command,
+}
+
+/// Local mirror of [`tars_melt::TelemetryFormat`]. Kept here (not on
+/// the `tars-melt` enum itself) so the observability crate doesn't pick
+/// up a `clap` dependency just to satisfy a CLI flag.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum LogFormat {
+    Pretty,
+    Json,
+}
+
+impl From<LogFormat> for TelemetryFormat {
+    fn from(f: LogFormat) -> Self {
+        match f {
+            LogFormat::Pretty => TelemetryFormat::Pretty,
+            LogFormat::Json => TelemetryFormat::Json,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -90,6 +115,12 @@ async fn main() -> ExitCode {
     // `-v/-vv/-vvv` would silently have no effect.
     let mut tcfg = TelemetryConfig::from_verbosity(cli.verbose);
     tcfg.service = "tars-cli".into();
+    // `--log-format` (or the matching env var) wins over the
+    // `TARS_LOG_FORMAT` consulted by `from_verbosity`. Spelled out as
+    // override-after-construct so the precedence is obvious to readers.
+    if let Some(f) = cli.log_format {
+        tcfg.format = f.into();
+    }
     let _telemetry = match tars_melt::init(tcfg) {
         Ok(guard) => Some(guard),
         Err(e) => {
@@ -164,5 +195,58 @@ async fn main() -> ExitCode {
             eprintln!("error in `tars {cmd_name}`: {e:?}");
             ExitCode::from(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_format_maps_one_to_one_to_telemetry_format() {
+        assert!(matches!(
+            TelemetryFormat::from(LogFormat::Pretty),
+            TelemetryFormat::Pretty
+        ));
+        assert!(matches!(
+            TelemetryFormat::from(LogFormat::Json),
+            TelemetryFormat::Json
+        ));
+    }
+
+    #[test]
+    fn cli_parses_log_format_flag() {
+        // Sanity: clap accepts the documented values without ambiguity.
+        let cli = Cli::try_parse_from([
+            "tars",
+            "--log-format",
+            "json",
+            "events",
+            "list",
+        ]).expect("parse");
+        assert!(matches!(cli.log_format, Some(LogFormat::Json)));
+
+        let cli = Cli::try_parse_from([
+            "tars",
+            "--log-format",
+            "pretty",
+            "events",
+            "list",
+        ]).expect("parse");
+        assert!(matches!(cli.log_format, Some(LogFormat::Pretty)));
+
+        // Omitted → None → fall through to TARS_LOG_FORMAT / Pretty.
+        let cli = Cli::try_parse_from(["tars", "events", "list"]).expect("parse");
+        assert!(cli.log_format.is_none());
+
+        // Unknown value → clap rejects (we never silently default).
+        let err = Cli::try_parse_from([
+            "tars",
+            "--log-format",
+            "yaml",
+            "events",
+            "list",
+        ]);
+        assert!(err.is_err(), "clap must reject unsupported values");
     }
 }
