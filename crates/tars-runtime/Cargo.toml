@@ -40,4 +40,5 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs"] }
 tempfile = "3"
 async-trait.workspace = true
 futures.workspace = true
+anyhow = "1"
 tars-provider = { path = "../tars-provider" }

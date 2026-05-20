@@ -2051,6 +2051,7 @@ dependencies = [
 name = "tars-runtime"
 version = "0.2.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "futures",
  "serde",
