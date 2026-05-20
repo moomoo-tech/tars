@@ -30,12 +30,14 @@ use serde_json::{Value, json};
 use url::Url;
 
 use tars_types::{
-    CacheDirective, Capabilities, ChatEvent, ChatRequest, ContentBlock, ImageData, Message,
-    Modality, PromptCacheKind, ProviderError, ProviderId, RequestContext, StopReason,
-    StructuredOutputMode, Usage,
+    BatchItemId, BatchJobId, BatchResultItem, BatchStatus, CacheDirective, Capabilities,
+    ChatEvent, ChatRequest, ChatResponse, ChatResponseBuilder, ContentBlock, ImageData,
+    Message, Modality, PromptCacheKind, ProviderError, ProviderId, RequestContext,
+    StopReason, StructuredOutputMode, Usage,
 };
 
 use crate::auth::{Auth, AuthResolver, ResolvedAuth};
+use crate::batch::BatchSubmitter;
 use crate::http_base::{
     HttpAdapter, HttpProviderBase, HttpProviderExtras, SseEvent, stream_via_adapter,
 };
@@ -160,6 +162,388 @@ impl LlmProvider for AnthropicProvider {
         let auth = self.auth_resolver.resolve(&self.auth, &ctx).await?;
         stream_via_adapter(self.http.clone(), self.adapter.clone(), auth, req, ctx).await
     }
+
+    fn as_batch_submitter(self: Arc<Self>) -> Option<Arc<dyn BatchSubmitter>> {
+        Some(self)
+    }
+}
+
+// ─── BatchSubmitter — Anthropic Message Batches API ────────────────
+//
+// Reference: <https://docs.anthropic.com/en/api/creating-message-batches>
+//
+// One-step submission (no separate file upload): the request body
+// inlines all items under `requests[]`. Vendor SLAs say up to 24 h,
+// usually faster. Pricing is ~50% of sync. Per-item failures surface
+// in `results()` while the overall job stays `Completed`.
+
+#[async_trait]
+impl BatchSubmitter for AnthropicProvider {
+    async fn submit(
+        &self,
+        items: Vec<(BatchItemId, ChatRequest)>,
+    ) -> Result<BatchJobId, ProviderError> {
+        if items.is_empty() {
+            return Err(ProviderError::InvalidRequest(
+                "batch submit: items list must not be empty".into(),
+            ));
+        }
+
+        // Reuse the streaming adapter's translate_request to build each
+        // line's `params` — same body shape the synchronous endpoint
+        // would have accepted.
+        let mut requests = Vec::with_capacity(items.len());
+        for (item_id, req) in items {
+            let params = self.adapter.translate_request(&req)?;
+            requests.push(json!({
+                "custom_id": item_id.as_str(),
+                "params": params,
+            }));
+        }
+        let body = json!({ "requests": requests });
+
+        let auth = self
+            .auth_resolver
+            .resolve(&self.auth, &RequestContext::test_default())
+            .await?;
+        let headers = self.adapter.build_headers(&auth)?;
+        let url = self.adapter.batch_url("")?;
+
+        let resp = self
+            .http
+            .client
+            .post(url)
+            .headers(headers)
+            .json(&body)
+            .send()
+            .await
+            .map_err(ProviderError::from)?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let h = resp.headers().clone();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(self.adapter.classify_error(status, &h, &text));
+        }
+
+        let v: Value = resp
+            .json()
+            .await
+            .map_err(|e| ProviderError::Parse(format!("batch submit: response not JSON: {e}")))?;
+        let id = v
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ProviderError::Parse("batch submit: response missing `id`".into()))?;
+        Ok(BatchJobId::new(id))
+    }
+
+    async fn status(&self, id: &BatchJobId) -> Result<BatchStatus, ProviderError> {
+        let auth = self
+            .auth_resolver
+            .resolve(&self.auth, &RequestContext::test_default())
+            .await?;
+        let headers = self.adapter.build_headers(&auth)?;
+        let url = self.adapter.batch_url(&format!("/{}", id.as_str()))?;
+
+        let resp = self
+            .http
+            .client
+            .get(url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(ProviderError::from)?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let h = resp.headers().clone();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(self.adapter.classify_error(status, &h, &text));
+        }
+
+        let v: Value = resp
+            .json()
+            .await
+            .map_err(|e| ProviderError::Parse(format!("batch status: response not JSON: {e}")))?;
+        translate_anthropic_batch_status(&v)
+    }
+
+    async fn results(
+        &self,
+        id: &BatchJobId,
+    ) -> Result<Vec<BatchResultItem>, ProviderError> {
+        // Anthropic's results endpoint 404s on non-terminal jobs; we
+        // pre-check here so the error path is uniform across vendors
+        // (see trait doc — `results()` on non-terminal is a caller bug,
+        // not a backend error).
+        let st = self.status(id).await?;
+        if !st.is_terminal() {
+            return Err(ProviderError::InvalidRequest(format!(
+                "batch results: job {id} is not yet terminal (status: {st:?})"
+            )));
+        }
+
+        let auth = self
+            .auth_resolver
+            .resolve(&self.auth, &RequestContext::test_default())
+            .await?;
+        let headers = self.adapter.build_headers(&auth)?;
+        let url = self
+            .adapter
+            .batch_url(&format!("/{}/results", id.as_str()))?;
+
+        let resp = self
+            .http
+            .client
+            .get(url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(ProviderError::from)?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let h = resp.headers().clone();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(self.adapter.classify_error(status, &h, &text));
+        }
+
+        let text = resp
+            .text()
+            .await
+            .map_err(ProviderError::from)?;
+        parse_anthropic_batch_results(&text)
+    }
+
+    async fn cancel(&self, id: &BatchJobId) -> Result<(), ProviderError> {
+        let auth = self
+            .auth_resolver
+            .resolve(&self.auth, &RequestContext::test_default())
+            .await?;
+        let headers = self.adapter.build_headers(&auth)?;
+        let url = self
+            .adapter
+            .batch_url(&format!("/{}/cancel", id.as_str()))?;
+
+        let resp = self
+            .http
+            .client
+            .post(url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(ProviderError::from)?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let h = resp.headers().clone();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(self.adapter.classify_error(status, &h, &text));
+        }
+        Ok(())
+    }
+}
+
+/// Translate Anthropic's batch status JSON into our vendor-neutral
+/// [`BatchStatus`]. The vendor reports `processing_status` plus a
+/// `request_counts` breakdown — we collapse "ended" into one of
+/// Completed / Cancelled / Expired based on the count distribution.
+fn translate_anthropic_batch_status(v: &Value) -> Result<BatchStatus, ProviderError> {
+    let status = v
+        .get("processing_status")
+        .and_then(|s| s.as_str())
+        .ok_or_else(|| {
+            ProviderError::Parse("batch status: missing `processing_status`".into())
+        })?;
+
+    let counts = v.get("request_counts").cloned().unwrap_or_else(|| json!({}));
+    let get = |k: &str| {
+        counts
+            .get(k)
+            .and_then(|n| n.as_u64())
+            .unwrap_or(0) as u32
+    };
+    let processing = get("processing");
+    let succeeded = get("succeeded");
+    let errored = get("errored");
+    let canceled = get("canceled");
+    let expired = get("expired");
+    let processed = succeeded + errored + canceled + expired;
+    let total = Some(processed + processing);
+
+    match status {
+        "in_progress" => Ok(BatchStatus::InProgress {
+            processed,
+            total,
+            eta: None,
+        }),
+        "canceling" => Ok(BatchStatus::InProgress {
+            processed,
+            total,
+            eta: None,
+        }),
+        "ended" => {
+            // Collapse the count distribution into one terminal state.
+            // Per-item issues surface in results() — the overall job
+            // is Completed unless every item ended the same non-success
+            // way (all cancelled / all expired).
+            if processed > 0 && canceled == processed {
+                Ok(BatchStatus::Cancelled)
+            } else if processed > 0 && expired == processed {
+                Ok(BatchStatus::Expired)
+            } else {
+                Ok(BatchStatus::Completed)
+            }
+        }
+        other => Err(ProviderError::Parse(format!(
+            "batch status: unknown `processing_status` value: {other:?}"
+        ))),
+    }
+}
+
+/// Parse Anthropic's results JSONL into [`BatchResultItem`]s. Each
+/// line has `custom_id` + `result.type` ∈ {succeeded, errored,
+/// canceled, expired}; we translate to a per-item `Result<ChatResponse, ProviderError>`.
+fn parse_anthropic_batch_results(text: &str) -> Result<Vec<BatchResultItem>, ProviderError> {
+    let mut items = Vec::new();
+    for (idx, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: Value = serde_json::from_str(line).map_err(|e| {
+            ProviderError::Parse(format!(
+                "batch results line {}: not JSON: {e}",
+                idx + 1
+            ))
+        })?;
+        let custom_id = v
+            .get("custom_id")
+            .and_then(|s| s.as_str())
+            .ok_or_else(|| {
+                ProviderError::Parse(format!(
+                    "batch results line {}: missing custom_id",
+                    idx + 1
+                ))
+            })?
+            .to_string();
+        let result_val = v.get("result").ok_or_else(|| {
+            ProviderError::Parse(format!(
+                "batch results line {}: missing result",
+                idx + 1
+            ))
+        })?;
+        let result_type = result_val
+            .get("type")
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| {
+                ProviderError::Parse(format!(
+                    "batch results line {}: missing result.type",
+                    idx + 1
+                ))
+            })?;
+
+        let outcome: Result<ChatResponse, ProviderError> = match result_type {
+            "succeeded" => {
+                let message = result_val.get("message").ok_or_else(|| {
+                    ProviderError::Parse(format!(
+                        "batch results line {}: succeeded but missing message",
+                        idx + 1
+                    ))
+                })?;
+                anthropic_message_to_chat_response(message)
+            }
+            "errored" => {
+                let err = result_val
+                    .get("error")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                let err_type = err
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("error");
+                let err_msg = err
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("(no message)");
+                Err(match err_type {
+                    "invalid_request_error" => {
+                        ProviderError::InvalidRequest(err_msg.to_string())
+                    }
+                    "authentication_error" => ProviderError::Auth(err_msg.to_string()),
+                    "rate_limit_error" => {
+                        ProviderError::RateLimited { retry_after: None }
+                    }
+                    "overloaded_error" => ProviderError::ModelOverloaded,
+                    _ => ProviderError::Internal(format!(
+                        "anthropic batch item error ({err_type}): {err_msg}"
+                    )),
+                })
+            }
+            "canceled" => Err(ProviderError::Internal("item cancelled".into())),
+            "expired" => Err(ProviderError::Internal("item expired".into())),
+            other => Err(ProviderError::Parse(format!(
+                "batch results line {}: unknown result.type {other:?}",
+                idx + 1
+            ))),
+        };
+
+        items.push(BatchResultItem {
+            item_id: BatchItemId::new(custom_id),
+            result: outcome,
+        });
+    }
+    Ok(items)
+}
+
+/// Convert one Anthropic message-shape JSON into a [`ChatResponse`] by
+/// replaying it through [`ChatResponseBuilder`]. Text content blocks
+/// become `Delta` events; we set the terminal `Finished` from
+/// `stop_reason` + `usage`.
+///
+/// **Known gap (Phase 2)**: `tool_use` content blocks are skipped.
+/// Batch consumers that need tool calls in batch responses can either
+/// (a) parse the raw `message` JSON themselves, or (b) wait for V2
+/// when we extend `ChatEvent::ToolCallStart/Args/End` replay here.
+fn anthropic_message_to_chat_response(msg: &Value) -> Result<ChatResponse, ProviderError> {
+    let model = msg
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("anthropic");
+    let mut acc = ChatResponseBuilder::new();
+    acc.apply(ChatEvent::started(model));
+
+    if let Some(blocks) = msg.get("content").and_then(|c| c.as_array()) {
+        for block in blocks {
+            if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                    acc.apply(ChatEvent::Delta {
+                        text: text.to_string(),
+                    });
+                }
+            }
+            // tool_use blocks: see fn doc-comment.
+        }
+    }
+
+    let stop_reason = match msg.get("stop_reason").and_then(|s| s.as_str()) {
+        Some("end_turn") => StopReason::EndTurn,
+        Some("max_tokens") => StopReason::MaxTokens,
+        Some("stop_sequence") => StopReason::StopSequence,
+        Some("tool_use") => StopReason::ToolUse,
+        _ => StopReason::EndTurn,
+    };
+
+    let u = msg.get("usage").cloned().unwrap_or_else(|| json!({}));
+    let usage_u64 = |k: &str| u.get(k).and_then(|n| n.as_u64()).unwrap_or(0);
+    let usage = Usage {
+        input_tokens: usage_u64("input_tokens"),
+        output_tokens: usage_u64("output_tokens"),
+        cached_input_tokens: usage_u64("cache_read_input_tokens"),
+        cache_creation_tokens: usage_u64("cache_creation_input_tokens"),
+        thinking_tokens: 0,
+    };
+    acc.apply(ChatEvent::Finished { stop_reason, usage });
+    Ok(acc.finish())
 }
 
 pub struct AnthropicAdapter {
@@ -284,6 +668,20 @@ impl AnthropicAdapter {
                 }
             }
         }
+    }
+}
+
+impl AnthropicAdapter {
+    /// Build a `messages/batches` URL with the given suffix. Used by the
+    /// `BatchSubmitter` impl on `AnthropicProvider` — `""` is the
+    /// collection (POST submit), `/{id}` is one job, `/{id}/results` and
+    /// `/{id}/cancel` are sub-resources.
+    pub(crate) fn batch_url(&self, suffix: &str) -> Result<Url, ProviderError> {
+        Url::parse(&format!(
+            "{}/v1/messages/batches{suffix}",
+            self.base_url.trim_end_matches('/')
+        ))
+        .map_err(|e| ProviderError::Internal(format!("bad anthropic batch url: {e}")))
     }
 }
 
